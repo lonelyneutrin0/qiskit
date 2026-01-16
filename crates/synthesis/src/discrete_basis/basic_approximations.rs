@@ -395,8 +395,8 @@ impl GateSequence {
                 DiscreteGate::Standard(sg) => {
                     circuit.push_standard_gate(*sg, &[], &[Qubit(0)]).unwrap();
                 }
-                DiscreteGate::Custom { matrix_u2, .. } => {
-                    // Create a UnitaryGate for custom gates
+                DiscreteGate::Custom { matrix_u2, name, .. } => {
+                    // Create a UnitaryGate for custom gates, using the stored name as label
                     let packed_inst = PackedInstruction {
                         op: PackedOperation::from_unitary(Box::new(UnitaryGate {
                             array: ArrayType::OneQ(*matrix_u2),
@@ -404,7 +404,7 @@ impl GateSequence {
                         qubits: circuit.add_qargs(&[Qubit(0)]),
                         clbits: Default::default(),
                         params: None,
-                        label: None,
+                        label: name.clone().map(|s| Box::new(s)),
                         #[cfg(feature = "cache_pygates")]
                         py_op: OnceLock::new(),
                     };

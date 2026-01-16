@@ -19,9 +19,9 @@ use qiskit_circuit::NoBlocks;
 use qiskit_circuit::circuit_data::CircuitData;
 use qiskit_circuit::circuit_instruction::OperationFromPython;
 use qiskit_circuit::instruction::Instruction;
-use qiskit_circuit::operations::{OperationRef, Param, StandardGate};
+use qiskit_circuit::operations::{Operation, OperationRef, Param, StandardGate};
 
-use crate::discrete_basis::basic_approximations::{BasicApproximations, GateSequence};
+use crate::discrete_basis::basic_approximations::{BasicApproximations, DiscreteGate, GateSequence};
 
 use super::basic_approximations::DiscreteBasisError;
 use super::math::{self, group_commutator_decomposition};
@@ -64,6 +64,21 @@ impl SolovayKitaevSynthesis {
     ) -> Result<Self, DiscreteBasisError> {
         let basic_approximations =
             BasicApproximations::generate_from_matrices(basis_matrices, depth, tol)?;
+        Ok(Self {
+            basic_approximations,
+            do_checks,
+        })
+    }
+
+    /// Initialize a new instance from a list of discrete gates (can be mixed standard and custom).
+    pub fn new_from_discrete(
+        basis_gates: &[DiscreteGate],
+        depth: usize,
+        tol: Option<f64>,
+        do_checks: bool,
+    ) -> Result<Self, DiscreteBasisError> {
+        let basic_approximations =
+            BasicApproximations::generate_from_discrete(basis_gates, depth, tol)?;
         Ok(Self {
             basic_approximations,
             do_checks,
@@ -202,8 +217,9 @@ impl SolovayKitaevSynthesis {
 #[pymethods]
 impl SolovayKitaevSynthesis {
     /// Args:
-    ///     basis_gates (list[Gate] | None): A list of discrete (i.e., non-parameterized) standard
-    ///         gates. Defaults to ``[H, T, Tdg]``.
+    ///     basis_gates (list[Gate] | None): A list of discrete (i.e., non-parameterized) gates.
+    ///         Each gate can be a standard gate (like H, T, Tdg) or any custom single-qubit gate.
+    ///         Defaults to ``[H, T, Tdg]``.
     ///     depth (int): The number of basis gate combinations to consider in the basis set. This
     ///         determines how fast (and if) the algorithm converges and should be chosen
     ///         sufficiently high. Defaults to 12,
@@ -218,23 +234,59 @@ impl SolovayKitaevSynthesis {
         tol: Option<f64>,
         do_checks: bool,
     ) -> PyResult<Self> {
-        // Extract list of standard gates from the input. Errors if a gate is not a standard gate.
-        let basis_gates: Vec<StandardGate> = match basis_gates {
-            None => vec![StandardGate::H, StandardGate::T, StandardGate::Tdg],
+        // Convert input gates to DiscreteGate enum
+        let discrete_gates: Vec<DiscreteGate> = match basis_gates {
+            None => vec![
+                DiscreteGate::Standard(StandardGate::H),
+                DiscreteGate::Standard(StandardGate::T),
+                DiscreteGate::Standard(StandardGate::Tdg),
+            ],
             Some(py_gates) => py_gates
                 .iter()
-                .map(|el| {
+                .enumerate()
+                .map(|(idx, el)| {
                     let py_op = el.extract::<OperationFromPython<NoBlocks>>()?;
                     match py_op.operation.view() {
-                        OperationRef::StandardGate(gate) => Ok(gate),
-                        _ => Err(PyValueError::new_err("Only standard gates accepted.")),
+                        // Fast path for standard gates
+                        OperationRef::StandardGate(gate) => Ok(DiscreteGate::Standard(gate)),
+                        // For any other gate, extract its matrix
+                        op => {
+                            let matrix = match py_op.try_matrix() {
+                                Some(m) => m,
+                                None => {
+                                    return Err(PyValueError::new_err(format!(
+                                        "Gate '{}' does not have a matrix representation.",
+                                        op.name()
+                                    )));
+                                }
+                            };
+                            // Ensure it's a 2x2 matrix (single qubit gate)
+                            if matrix.shape() != [2, 2] {
+                                return Err(PyValueError::new_err(format!(
+                                    "Gate '{}' is not a single-qubit gate (expected 2x2 matrix, got {:?}).",
+                                    op.name(), matrix.shape()
+                                )));
+                            }
+                            let matrix_u2 = Matrix2::new(
+                                matrix[(0, 0)],
+                                matrix[(0, 1)],
+                                matrix[(1, 0)],
+                                matrix[(1, 1)],
+                            );
+                            // Use the gate's label if available, otherwise fall back to name
+                            let gate_name = py_op.label
+                                .as_ref()
+                                .map(|s| s.as_str().to_string())
+                                .unwrap_or_else(|| op.name().to_string());
+                            Ok(DiscreteGate::custom(matrix_u2, idx, Some(gate_name)))
+                        }
                     }
                 })
                 .collect::<PyResult<_>>()?,
         };
 
-        // Construct self. Errors if a gate is not a discrete standard gate.
-        Self::new(&basis_gates, depth, tol, do_checks).map_err(|err| err.into())
+        // Construct self using the unified discrete gate constructor
+        Self::new_from_discrete(&discrete_gates, depth, tol, do_checks).map_err(|err| err.into())
     }
 
     /// Getter for whether to perform runtime checks on the inputs.
