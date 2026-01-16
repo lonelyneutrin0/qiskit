@@ -222,6 +222,12 @@ from .discrete_basis import (
     gridsynth_rz,
     gridsynth_unitary,
 )
+
+# Import the Rust implementation directly
+try:
+    from qiskit._accelerate.synthesis.discrete_basis import SolovayKitaevSynthesis
+except ImportError:
+    pass
 from .qft import synth_qft_line, synth_qft_full
 from .unitary.qsd import qs_decomposition
 from .unitary import aqc

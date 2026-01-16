@@ -15,3 +15,9 @@
 from .solovay_kitaev import SolovayKitaevDecomposition
 from .generate_basis_approximations import generate_basic_approximations
 from .ross_selinger import gridsynth_rz, gridsynth_unitary
+
+# Import the Rust implementation directly
+try:
+    from qiskit._accelerate.synthesis.discrete_basis import SolovayKitaevSynthesis
+except ImportError:
+    pass

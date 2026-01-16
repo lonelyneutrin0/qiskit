@@ -56,6 +56,21 @@ impl SolovayKitaevSynthesis {
         })
     }
 
+    pub fn new_from_matrices(
+        basis_matrices: &[Matrix2<Complex64>],
+        depth: usize,
+        tol: Option<f64>,
+        do_checks: bool,
+    ) -> Result<Self, DiscreteBasisError> {
+        let basic_approximations =
+            BasicApproximations::generate_from_matrices(basis_matrices, depth, tol)?;
+        Ok(Self {
+            basic_approximations,
+            do_checks,
+        })
+    }
+
+
     /// Run the Solovay Kitaev algorithm, given the initial unitary as U(2) matrix.
     ///
     /// This matrix is given using [Complex64] numbers, which can limit the precision of the
@@ -386,6 +401,47 @@ impl SolovayKitaevSynthesis {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Create a SolovayKitaevSynthesis instance from custom gate matrices.
+    ///
+    /// This method allows using arbitrary unitary matrices as basis gates for the
+    /// Solovay-Kitaev algorithm, enabling decomposition into custom gate sets.
+    ///
+    /// Args:
+    ///     basis_matrices (list[np.ndarray]): A list of 2x2 complex unitary matrices
+    ///         representing the basis gates.
+    ///     depth (int): The number of basis gate combinations to consider in the basis set.
+    ///         This determines how fast (and if) the algorithm converges. Defaults to 12.
+    ///     tol (float | None): A tolerance determining the granularity of the basic approximations.
+    ///         Defaults to ``1e-12``.
+    ///     do_checks (bool): Whether to perform runtime validation. Defaults to False.
+    ///
+    /// Returns:
+    ///     SolovayKitaevSynthesis: A new instance using the provided matrices as basis gates.
+    ///
+    /// Example:
+    ///     >>> import numpy as np
+    ///     >>> from qiskit.synthesis import SolovayKitaevSynthesis
+    ///     >>> # Define custom gate matrices
+    ///     >>> s_gate = np.array([[1, 0], [0, 1j]], dtype=complex)
+    ///     >>> h_gate = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
+    ///     >>> # Create synthesizer with custom gates
+    ///     >>> sk = SolovayKitaevSynthesis.from_matrices([s_gate, h_gate], depth=10)
+    #[staticmethod]
+    #[pyo3(signature = (basis_matrices, depth=12, tol=None, do_checks=false))]
+    fn from_matrices(
+        basis_matrices: Vec<PyReadonlyArray2<Complex64>>,
+        depth: usize,
+        tol: Option<f64>,
+        do_checks: bool,
+    ) -> PyResult<Self> {
+        let matrices: Vec<Matrix2<Complex64>> = basis_matrices
+            .iter()
+            .map(|array| matrix2_from_pyreadonly(array))
+            .collect();
+
+        Self::new_from_matrices(&matrices, depth, tol, do_checks).map_err(|err| err.into())
     }
 }
 

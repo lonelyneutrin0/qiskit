@@ -20,11 +20,13 @@ use qiskit_circuit::{
     NoBlocks, Qubit,
     circuit_data::CircuitData,
     circuit_instruction::OperationFromPython,
-    operations::{Operation, OperationRef, Param, StandardGate},
+    operations::{ArrayType, Operation, OperationRef, Param, StandardGate, UnitaryGate},
+    packed_instruction::{PackedInstruction, PackedOperation},
 };
 use rstar::{Point, RTree};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 use super::math;
@@ -44,6 +46,123 @@ impl From<DiscreteBasisError> for PyErr {
     }
 }
 
+/// A discrete gate that can be either a standard gate or a custom gate defined by its matrix.
+///
+/// This allows the Solovay-Kitaev algorithm to work with both built-in gates and user-defined
+/// custom gates while maintaining a clean interface.
+#[derive(Clone, Debug)]
+pub enum DiscreteGate {
+    /// A standard Qiskit gate (H, T, Tdg, etc.)
+    Standard(StandardGate),
+    /// A custom gate defined by its U(2) matrix, SO(3) representation, phase, and optional name
+    Custom {
+        /// The U(2) matrix representation of the gate
+        matrix_u2: Matrix2<Complex64>,
+        /// The SO(3) representation (cached for efficiency)
+        matrix_so3: Matrix3<f64>,
+        /// The global phase
+        phase: f64,
+        /// Optional name for the gate (for display purposes)
+        name: Option<String>,
+        /// Index into the original basis set (for serialization)
+        basis_index: usize,
+    },
+}
+
+impl DiscreteGate {
+    /// Create a new custom gate from a U(2) matrix.
+    pub fn custom(matrix_u2: Matrix2<Complex64>, basis_index: usize, name: Option<String>) -> Self {
+        let (matrix_so3, phase) = math::u2_to_so3(&matrix_u2);
+        DiscreteGate::Custom {
+            matrix_u2,
+            matrix_so3,
+            phase,
+            name,
+            basis_index,
+        }
+    }
+
+    /// Create from a StandardGate.
+    pub fn standard(gate: StandardGate) -> Self {
+        DiscreteGate::Standard(gate)
+    }
+
+    /// Get the SO(3) matrix representation.
+    pub fn to_so3(&self) -> Result<(Matrix3<f64>, f64), DiscreteBasisError> {
+        match self {
+            DiscreteGate::Standard(gate) => math::standard_gates_to_so3(gate, &[]),
+            DiscreteGate::Custom { matrix_so3, phase, .. } => Ok((*matrix_so3, *phase)),
+        }
+    }
+
+    /// Get the U(2) matrix representation.
+    pub fn to_u2(&self) -> Result<Matrix2<Complex64>, DiscreteBasisError> {
+        match self {
+            DiscreteGate::Standard(gate) => math::standard_gates_to_u2(gate, &[]),
+            DiscreteGate::Custom { matrix_u2, .. } => Ok(*matrix_u2),
+        }
+    }
+
+    /// Get the inverse of this gate.
+    pub fn inverse(&self) -> Option<DiscreteGate> {
+        match self {
+            DiscreteGate::Standard(gate) => {
+                let (inv_gate, _) = gate.inverse(&[])?;
+                Some(DiscreteGate::Standard(inv_gate))
+            }
+            DiscreteGate::Custom { matrix_u2, basis_index, name, .. } => {
+                // The inverse of a unitary is its conjugate transpose
+                let inv_matrix = matrix_u2.adjoint();
+                let inv_name = name.as_ref().map(|n| format!("{}_dag", n));
+                Some(DiscreteGate::custom(inv_matrix, *basis_index, inv_name))
+            }
+        }
+    }
+
+    /// Get the name of the gate.
+    pub fn name(&self) -> &str {
+        match self {
+            DiscreteGate::Standard(gate) => gate.name(),
+            DiscreteGate::Custom { name, .. } => {
+                name.as_deref().unwrap_or("custom")
+            }
+        }
+    }
+
+    /// Check if two gates are inverses of each other.
+    pub fn is_inverse_of(&self, other: &DiscreteGate) -> bool {
+        match (self, other) {
+            (DiscreteGate::Standard(g1), DiscreteGate::Standard(g2)) => {
+                if let Some((inv, _)) = g1.inverse(&[]) {
+                    inv == *g2
+                } else {
+                    false
+                }
+            }
+            (DiscreteGate::Custom { matrix_u2: m1, .. }, DiscreteGate::Custom { matrix_u2: m2, .. }) => {
+                // Check if m1 * m2 ≈ I
+                let product = m1 * m2;
+                let identity = Matrix2::identity();
+                (product - identity).norm() < 1e-10
+            }
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq for DiscreteGate {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (DiscreteGate::Standard(g1), DiscreteGate::Standard(g2)) => g1 == g2,
+            (DiscreteGate::Custom { basis_index: i1, .. }, DiscreteGate::Custom { basis_index: i2, .. }) => {
+                i1 == i2
+            }
+            _ => false,
+        }
+    }
+}
+
+
 /// A sequence of single qubit gates and their matrix.
 ///
 /// Gates are stored in **circuit order**, not in matrix multiplication order. That means that
@@ -52,52 +171,83 @@ impl From<DiscreteBasisError> for PyErr {
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct GateSequence {
-    // The sequence of standard gates.
-    pub gates: Vec<StandardGate>,
-    // The SO(3) representation of the sequence. Note that this is only equal to SU(2) up to a sign.
+    /// The sequence of discrete gates (can be standard or custom).
+    pub gates: Vec<DiscreteGate>,
+    /// The SO(3) representation of the sequence. Note that this is only equal to SU(2) up to a sign.
     pub matrix_so3: Matrix3<f64>,
-    // A global phase taking the U(2) representation of the sequence to SU(2).
+    /// A global phase taking the U(2) representation of the sequence to SU(2).
     pub phase: f64,
 }
 
 /// A serializable version of the [GateSequence] used to store and retrieve [BasicApproximations].
 #[derive(Serialize, Deserialize)]
 struct SerializableGateSequence {
-    gates: Vec<u8>,
+    /// For standard gates: stores the gate ID as u8
+    /// For custom gates: stores u8::MAX as a marker
+    gate_markers: Vec<u8>,
+    /// Indices for custom gates into the basis set
+    custom_indices: Vec<usize>,
     matrix_so3: Vec<f64>,
     phase: f64,
 }
 
 impl From<&GateSequence> for SerializableGateSequence {
     fn from(value: &GateSequence) -> Self {
-        // store the StandardGates as u8
-        let gates = value
-            .gates
-            .iter()
-            .map(|gate| *gate as u8)
-            .collect::<Vec<u8>>();
+        let mut gate_markers = Vec::with_capacity(value.gates.len());
+        let mut custom_indices = Vec::new();
+
+        for gate in &value.gates {
+            match gate {
+                DiscreteGate::Standard(sg) => {
+                    gate_markers.push(*sg as u8);
+                }
+                DiscreteGate::Custom { basis_index, .. } => {
+                    gate_markers.push(u8::MAX); // Marker for custom gate
+                    custom_indices.push(*basis_index);
+                }
+            }
+        }
 
         // store the SO(3) matrix as flattened vector
         let matrix_so3 = value.matrix_so3.iter().copied().collect::<Vec<f64>>();
 
         Self {
-            gates,
+            gate_markers,
+            custom_indices,
             matrix_so3,
             phase: value.phase,
         }
     }
 }
 
-impl From<&SerializableGateSequence> for GateSequence {
-    fn from(value: &SerializableGateSequence) -> Self {
-        // map u8 back into StandardGate
-        let gates = value
-            .gates
-            .iter()
-            .map(|gate_id| ::bytemuck::checked::cast::<_, StandardGate>(*gate_id))
-            .collect::<Vec<StandardGate>>();
+/// Context needed to deserialize a GateSequence (contains custom gate definitions)
+pub struct DeserializationContext {
+    pub custom_gates: Vec<DiscreteGate>,
+}
 
-        // map serialized matrix back into Matrix3
+impl GateSequence {
+    /// Deserialize from a SerializableGateSequence with context for custom gates.
+    pub fn from_serializable(value: &SerializableGateSequence, ctx: Option<&DeserializationContext>) -> Self {
+        let mut gates = Vec::with_capacity(value.gate_markers.len());
+        let mut custom_idx = 0;
+
+        for &marker in &value.gate_markers {
+            if marker == u8::MAX {
+                // Custom gate - look up from context
+                if let Some(context) = ctx {
+                    let basis_index = value.custom_indices[custom_idx];
+                    if basis_index < context.custom_gates.len() {
+                        gates.push(context.custom_gates[basis_index].clone());
+                    }
+                }
+                custom_idx += 1;
+            } else {
+                // Standard gate
+                let gate = ::bytemuck::checked::cast::<_, StandardGate>(marker);
+                gates.push(DiscreteGate::Standard(gate));
+            }
+        }
+
         let matrix_so3 = Matrix3::from_iterator(value.matrix_so3.clone());
 
         Self {
@@ -106,11 +256,9 @@ impl From<&SerializableGateSequence> for GateSequence {
             phase: value.phase,
         }
     }
-}
 
-impl GateSequence {
     /// Create a new, empty sequence.
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             gates: vec![],
             matrix_so3: Matrix3::identity(),
@@ -150,7 +298,7 @@ impl GateSequence {
             .gates
             .iter()
             .rev()
-            .map(|&gate| gate.inverse(&[]).unwrap().0)
+            .filter_map(|gate| gate.inverse())
             .collect();
 
         // The transpose of an orthogonal matrix is equal to its inverse
@@ -169,29 +317,27 @@ impl GateSequence {
             return; // there is nothing to cancel for 0 or 1 gate(s)
         }
 
-        let mut reduced_gates: Vec<StandardGate> = Vec::with_capacity(self.gates.len());
+        let mut reduced_gates: Vec<DiscreteGate> = Vec::with_capacity(self.gates.len());
         for gate in &self.gates {
             // if we have a last gate check whether it cancels with the next one
             if let Some(last) = reduced_gates.last() {
-                let inverse = gate.inverse(&[]).expect("Failed to get inverse").0;
-                if *last == inverse {
+                if gate.is_inverse_of(last) {
                     reduced_gates.pop();
                     continue;
                 }
             }
             // we didn't have a gate in the queue yet or we don't have a cancelling pair
-            reduced_gates.push(*gate);
+            reduced_gates.push(gate.clone());
         }
 
         self.gates = reduced_gates;
     }
 
-    /// Get the U(2) matrix implemented by the gates. Fails if the gates are ``None`` and no U(2)
-    /// matrix is cached.
+    /// Get the U(2) matrix implemented by the gates.
     pub fn u2(&self) -> Result<Matrix2<Complex<f64>>, DiscreteBasisError> {
         let mut out = Matrix2::identity();
         for gate in &self.gates {
-            let matrix = math::standard_gates_to_u2(gate, &[])?;
+            let matrix = gate.to_u2()?;
             out = matrix * out;
         }
         Ok(out)
@@ -245,15 +391,33 @@ impl GateSequence {
 
         let mut circuit = CircuitData::with_capacity(1, 0, self.gates.len(), global_phase).unwrap();
         for gate in &self.gates {
-            circuit.push_standard_gate(*gate, &[], &[Qubit(0)]).unwrap();
+            match gate {
+                DiscreteGate::Standard(sg) => {
+                    circuit.push_standard_gate(*sg, &[], &[Qubit(0)]).unwrap();
+                }
+                DiscreteGate::Custom { matrix_u2, .. } => {
+                    // Create a UnitaryGate for custom gates
+                    let packed_inst = PackedInstruction {
+                        op: PackedOperation::from_unitary(Box::new(UnitaryGate {
+                            array: ArrayType::OneQ(*matrix_u2),
+                        })),
+                        qubits: circuit.add_qargs(&[Qubit(0)]),
+                        clbits: Default::default(),
+                        params: None,
+                        label: None,
+                        #[cfg(feature = "cache_pygates")]
+                        py_op: OnceLock::new(),
+                    };
+                    circuit.push(packed_inst).unwrap();
+                }
+            }
         }
         Ok(circuit)
     }
 
-    /// Push a new standard gate onto [self].
-    fn push(&mut self, gate: StandardGate) -> Result<(), DiscreteBasisError> {
-        // turn into a SU(2) matrix and compute SO(3) representation from it
-        let (so3_matrix, phase) = math::standard_gates_to_so3(&gate, &[])?;
+    /// Push a new discrete gate onto [self].
+    pub fn push_discrete(&mut self, gate: DiscreteGate) -> Result<(), DiscreteBasisError> {
+        let (so3_matrix, phase) = gate.to_so3()?;
 
         // update matrix representations and keep track of the gate
         self.matrix_so3 = so3_matrix * self.matrix_so3;
@@ -261,6 +425,11 @@ impl GateSequence {
         self.gates.push(gate);
 
         Ok(())
+    }
+
+    /// Push a new standard gate onto [self].
+    fn push(&mut self, gate: StandardGate) -> Result<(), DiscreteBasisError> {
+        self.push_discrete(DiscreteGate::Standard(gate))
     }
 
     /// Return an iterator that adds every gate in ``additions`` to the current sequence.
@@ -271,6 +440,18 @@ impl GateSequence {
         additions.iter().map(|gate| {
             let mut out = self.clone();
             out.push(*gate)?;
+            Ok(out)
+        })
+    }
+
+    /// Return an iterator that adds every discrete gate in ``additions`` to the current sequence.
+    pub fn iter_discrete_additions<'a>(
+        &'a self,
+        additions: &'a [DiscreteGate],
+    ) -> impl Iterator<Item = Result<GateSequence, DiscreteBasisError>> + 'a {
+        additions.iter().map(|gate| {
+            let mut out = self.clone();
+            out.push_discrete(gate.clone())?;
             Ok(out)
         })
     }
@@ -291,7 +472,7 @@ impl GateSequence {
         let gates = gates
             .iter()
             .map(|op| match op.operation.view() {
-                OperationRef::StandardGate(gate) => Ok(gate),
+                OperationRef::StandardGate(gate) => Ok(DiscreteGate::Standard(gate)),
                 _ => Err(PyValueError::new_err(
                     "Only standard gates are allowed in GateSequence.from_gates_and_matrix",
                 )),
@@ -427,6 +608,75 @@ impl BasicApproximations {
         })
     }
 
+    /// Generate a tree of basic approximations from a set of discrete gates (can be mixed
+    /// standard and custom gates).
+    ///
+    /// This is the unified method that works with both StandardGates and custom gates.
+    pub fn generate_from_discrete(
+        basis_gates: &[DiscreteGate],
+        depth: usize,
+        tol: Option<f64>,
+    ) -> Result<Self, DiscreteBasisError> {
+        let mut points: RTree<BasicPoint> = RTree::new();
+        let mut approximations: HashMap<usize, GateSequence> = HashMap::new();
+
+        // identity approximation
+        let root = GateSequence::new();
+        points.insert(BasicPoint::from_sequence(&root, 0));
+        approximations.insert(0, root);
+        let mut index = 1;
+
+        let mut this_level: Vec<GateSequence> = vec![GateSequence::new()];
+        let mut next_level: Vec<GateSequence> = Vec::new();
+        let radius_sq = tol.unwrap_or(1e-12);
+
+        for _ in 0..depth {
+            for node in this_level.iter() {
+                for candidate in node.iter_discrete_additions(basis_gates) {
+                    let candidate = candidate?;
+                    let point = BasicPoint::from_sequence(&candidate, index);
+                    if points
+                        .locate_within_distance(point.clone(), radius_sq)
+                        .next()
+                        .is_none()
+                    {
+                        // we don't have this point yet
+                        points.insert(point);
+                        approximations.insert(index, candidate.clone());
+                        index += 1;
+                        next_level.push(candidate);
+                    }
+                }
+            }
+            this_level.clone_from(&next_level);
+            next_level.clear();
+        }
+
+        Ok(Self {
+            points,
+            approximations,
+        })
+    }
+
+    /// Generate a tree of basic approximations from a list of U(2) matrices.
+    ///
+    /// Each matrix is treated as a custom gate and will be properly tracked in the output
+    /// sequences, allowing circuit generation to work correctly.
+    pub fn generate_from_matrices(
+        basis_matrices: &[Matrix2<Complex<f64>>],
+        depth: usize,
+        tol: Option<f64>,
+    ) -> Result<Self, DiscreteBasisError> {
+        // Convert matrices to DiscreteGate::Custom
+        let basis_gates: Vec<DiscreteGate> = basis_matrices
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| DiscreteGate::custom(*m, idx, Some(format!("custom_{}", idx))))
+            .collect();
+
+        Self::generate_from_discrete(&basis_gates, depth, tol)
+    }
+
     /// Load from a slice of [GateSequence] objects.
     ///
     /// This is for legacy compatibility with the old Python version of SK.
@@ -458,6 +708,9 @@ impl BasicApproximations {
 
     /// Save the basic approximations into a file. This can be used to load the object again,
     /// see [Self::load].
+    ///
+    /// Note: When saving sequences with custom gates, the custom gate matrices are not saved.
+    /// Use `load_with_context` to restore them.
     pub fn save(&self, filename: &str) -> ::std::io::Result<()> {
         // we turn the HashMap with GateSequences as keys into a HashMap
         // with SerializableGateSequence as key
@@ -474,16 +727,27 @@ impl BasicApproximations {
     }
 
     /// Load the basic approximations from a file. See [Self::save] for saving the object.
+    ///
+    /// Note: This only works correctly for sequences containing only StandardGates.
+    /// For sequences with custom gates, use `load_with_context`.
     pub fn load(filename: &str) -> ::std::io::Result<Self> {
-        // store the now serializable HashMap
+        Self::load_with_context(filename, None)
+    }
+
+    /// Load the basic approximations from a file with context for custom gates.
+    ///
+    /// # Arguments
+    /// * `filename` - Path to the saved file
+    /// * `ctx` - Optional context containing custom gate definitions for deserialization
+    pub fn load_with_context(filename: &str, ctx: Option<&DeserializationContext>) -> ::std::io::Result<Self> {
         let file = ::std::fs::File::open(filename)?;
         let serializable_approx: HashMap<usize, SerializableGateSequence> =
             bincode::deserialize_from(file).map_err(::std::io::Error::other)?;
 
-        // construct the GateSequence from it's serializable version
+        // construct the GateSequence from its serializable version
         let approximations = serializable_approx
             .iter()
-            .map(|(key, value)| (*key, GateSequence::from(value)))
+            .map(|(key, value)| (*key, GateSequence::from_serializable(value, ctx)))
             .collect::<HashMap<usize, GateSequence>>();
 
         // build the RTree from the sequences

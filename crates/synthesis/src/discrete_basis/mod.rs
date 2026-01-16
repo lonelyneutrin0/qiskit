@@ -16,6 +16,9 @@ pub mod solovay_kitaev;
 
 use pyo3::prelude::*;
 
+// Re-export key types for external use
+pub use basic_approximations::{DiscreteGate, GateSequence, BasicApproximations, DeserializationContext};
+
 pub fn discrete_basis(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<solovay_kitaev::SolovayKitaevSynthesis>()?;
     m.add_class::<basic_approximations::GateSequence>()?;
