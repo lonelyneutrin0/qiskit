@@ -97,7 +97,23 @@ impl SolovayKitaevSynthesis {
         matrix_u2: &Matrix2<Complex64>,
         recursion_degree: usize,
     ) -> Result<CircuitData, DiscreteBasisError> {
+        // Validate input matrix
+        if matrix_u2.iter().any(|c| !c.is_finite()) {
+            return Err(DiscreteBasisError::InvalidMatrix(
+                "Input gate matrix contains NaN or Inf values.".to_string()
+            ));
+        }
+
         let (matrix_so3, phase) = math::u2_to_so3(matrix_u2);
+
+        // Validate SO(3) conversion result
+        if matrix_so3.iter().any(|&v| !v.is_finite()) {
+            return Err(DiscreteBasisError::InvalidMatrix(
+                "Conversion of input gate to SO(3) produced NaN or Inf. \
+                 The input matrix may not be a valid unitary.".to_string()
+            ));
+        }
+
         let mut output = self.recurse(&matrix_so3, recursion_degree);
 
         output.inverse_cancellation();
@@ -169,6 +185,21 @@ impl SolovayKitaevSynthesis {
     /// basic approximations. Otherwise, decompose the difference between the approximation
     /// and the target unitary as balanced group commutator, and recurse on each element.
     fn recurse(&self, matrix_so3: &Matrix3<f64>, degree: usize) -> GateSequence {
+        // Validate input matrix doesn't contain NaN
+        if matrix_so3.iter().any(|&val| !val.is_finite()) {
+            // Find which values are problematic
+            let bad_indices: Vec<_> = matrix_so3.iter()
+                .enumerate()
+                .filter(|&(_, v)| !v.is_finite())
+                .map(|(i, v)| format!("[{},{}]={}", i / 3, i % 3, v))
+                .collect();
+            panic!(
+                "Internal error in Solovay-Kitaev recursion (degree={}): SO(3) matrix contains NaN or Inf at {}. \
+                 This is unexpected if input validation passed. Matrix:\n{:?}",
+                degree, bad_indices.join(", "), matrix_so3
+            );
+        }
+
         // Recursion root: return the best approximation in the precomputed set.
         if degree == 0 {
             if self.do_checks {
@@ -177,7 +208,9 @@ impl SolovayKitaevSynthesis {
             let basic_approximation = self
                 .basic_approximations
                 .query(matrix_so3)
-                .expect("No basic approximation in root found")
+                .expect(
+                    "No basic approximation found. This may indicate numerical issues                     with the input unitary or a degenerate basis set."
+                )
                 .clone();
             return basic_approximation;
         }
@@ -187,7 +220,40 @@ impl SolovayKitaevSynthesis {
 
         // ... and then improve the delta in between that approximation and the target.
         let delta = matrix_so3 * u_n1.matrix_so3.transpose();
+
+        // If delta is close to identity (trace ≈ 3), the approximation is already
+        // very good and group commutator decomposition becomes numerically unstable.
+        // In this case, just return the current approximation.
+        let delta_trace = delta.trace();
+        if delta_trace > 3.0 - 1e-10 {
+            return u_n1;
+        }
+
+        // Validate delta doesn't have NaN before group commutator decomposition
+        if delta.iter().any(|&val| !val.is_finite()) {
+            panic!(
+                "Delta matrix contains NaN or Inf during Solovay-Kitaev recursion. \
+                 The basis gates may be numerically degenerate."
+            );
+        }
+
         let (matrix_vn, matrix_wn) = group_commutator_decomposition(&delta, self.do_checks);
+
+        // Validate group commutator decomposition output
+        if matrix_vn.iter().any(|&val| !val.is_finite()) {
+            panic!(
+                "Group commutator decomposition produced NaN/Inf in V matrix. \
+                 Delta matrix:\n{:?}\nV:\n{:?}",
+                delta, matrix_vn
+            );
+        }
+        if matrix_wn.iter().any(|&val| !val.is_finite()) {
+            panic!(
+                "Group commutator decomposition produced NaN/Inf in W matrix. \
+                 Delta matrix:\n{:?}\nW:\n{:?}",
+                delta, matrix_wn
+            );
+        }
 
         // Recurse on the group commutator elements.
         let v_n1 = self.recurse(&matrix_vn, degree - 1);

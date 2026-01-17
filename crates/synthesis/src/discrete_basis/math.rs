@@ -24,7 +24,8 @@ use super::basic_approximations::DiscreteBasisError;
 /// Solve equation (10) in https://arxiv.org/pdf/quant-ph/0505030 by using the
 /// substitution sin(u/2) = sin^2(phi/4).
 pub(crate) fn solve_decomposition_angle(matrix: &Matrix3<f64>) -> f64 {
-    let trace = matrix.trace().min(3.0); // avoid roundoff errors
+    // Clamp trace to valid range [-1, 3] to avoid NaN from acos due to numerical errors
+    let trace = matrix.trace().clamp(-1.0, 3.0);
     let angle = ((trace - 1.) / 2.).acos();
 
     2. * (angle / 4.).sin().sqrt().abs().asin()
@@ -121,6 +122,20 @@ fn rotation_matrix(from: &Matrix3x1<f64>, to: &Matrix3x1<f64>, do_checks: bool) 
     let from = from.normalize();
     let to = to.normalize();
     let dot = from.dot(&to);
+
+    // Handle the case where vectors are nearly anti-parallel (dot ≈ -1)
+    // In this case, use a rotation by π around an arbitrary perpendicular axis
+    if dot < -1.0 + 1e-10 {
+        // Find a perpendicular vector
+        let perp = if from[0].abs() < 0.9 {
+            Matrix3x1::new(1.0, 0.0, 0.0)
+        } else {
+            Matrix3x1::new(0.0, 1.0, 0.0)
+        };
+        let axis = from.cross(&perp).normalize();
+        // Rotation by π around the perpendicular axis
+        return so3_from_angle_axis(std::f64::consts::PI, &axis);
+    }
 
     let mut cross = Matrix3::zeros();
     add_cross_prod(1., &from.cross(&to), &mut cross);

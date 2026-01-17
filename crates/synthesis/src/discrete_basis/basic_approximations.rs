@@ -26,6 +26,7 @@ use qiskit_circuit::{
 use rstar::{Point, RTree};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::ops::Div;
 use std::sync::OnceLock;
 use thiserror::Error;
 
@@ -38,6 +39,9 @@ pub enum DiscreteBasisError {
 
     #[error("Cannot extract matrix from operation.")]
     NoMatrix,
+
+    #[error("Invalid matrix: {0}")]
+    InvalidMatrix(String),
 }
 
 impl From<DiscreteBasisError> for PyErr {
@@ -71,10 +75,61 @@ pub enum DiscreteGate {
 
 impl DiscreteGate {
     /// Create a new custom gate from a U(2) matrix.
+    ///
+    /// The matrix is normalized to SU(2) (determinant = 1) prior to conversion,
+    /// ensuring consistency with how standard gates are processed.
     pub fn custom(matrix_u2: Matrix2<Complex64>, basis_index: usize, name: Option<String>) -> Self {
-        let (matrix_so3, phase) = math::u2_to_so3(&matrix_u2);
+        // Validate input matrix doesn't contain NaN or Inf
+        if matrix_u2.iter().any(|&c| !c.is_finite()) {
+            panic!(
+                "Custom gate matrix contains NaN or Inf values. \
+                 Please provide a valid unitary matrix."
+            );
+        }
+
+        // Normalize U(2) to SU(2) by dividing by sqrt(determinant), similar to
+        // how standard gates are already normalized. This ensures custom gates
+        // are processed consistently.
+        let determinant = matrix_u2.determinant();
+        let det_sqrt = determinant.sqrt();
+
+        // Validate determinant is valid for normalization
+        if !det_sqrt.is_finite() || det_sqrt.norm() < 1e-15 {
+            panic!(
+                "Custom gate matrix has invalid determinant ({:?}). \
+                 The matrix may be singular or degenerate.",
+                determinant
+            );
+        }
+
+        let matrix_su2 = matrix_u2.div(det_sqrt);
+
+        // Validate the normalized matrix is valid
+        if matrix_su2.iter().any(|&c| !c.is_finite()) {
+            panic!(
+                "Normalization of custom gate matrix produced NaN or Inf. \
+                 The input matrix may have numerical issues."
+            );
+        }
+
+        // Compute SO(3) representation directly from SU(2) without re-normalizing
+        let matrix_so3 = math::su2_to_so3(&matrix_su2);
+
+        // Validate SO(3) matrix is valid
+        if matrix_so3.iter().any(|&v| !v.is_finite()) {
+            panic!(
+                "Conversion of custom gate to SO(3) produced NaN or Inf. \
+                 Input matrix:\n{:?}\nNormalized SU(2):\n{:?}\nSO(3):\n{:?}",
+                matrix_u2, matrix_su2, matrix_so3
+            );
+        }
+
+        // Compute phase from the normalization factor
+        let z = Complex64::new(1.0, 0.0) / det_sqrt;
+        let phase = z.im.atan2(z.re);
+
         DiscreteGate::Custom {
-            matrix_u2,
+            matrix_u2: matrix_su2,
             matrix_so3,
             phase,
             name,
@@ -139,13 +194,21 @@ impl DiscreteGate {
                     false
                 }
             }
-            (DiscreteGate::Custom { matrix_u2: m1, .. }, DiscreteGate::Custom { matrix_u2: m2, .. }) => {
-                // Check if m1 * m2 ≈ I
+            _ => {
+                // For custom gates or mixed standard/custom pairs, use matrix multiplication
+                // to check if the product is approximately identity
+                let m1 = match self.to_u2() {
+                    Ok(m) => m,
+                    Err(_) => return false,
+                };
+                let m2 = match other.to_u2() {
+                    Ok(m) => m,
+                    Err(_) => return false,
+                };
                 let product = m1 * m2;
                 let identity = Matrix2::identity();
                 (product - identity).norm() < 1e-10
             }
-            _ => false,
         }
     }
 }
@@ -154,8 +217,9 @@ impl PartialEq for DiscreteGate {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (DiscreteGate::Standard(g1), DiscreteGate::Standard(g2)) => g1 == g2,
-            (DiscreteGate::Custom { basis_index: i1, .. }, DiscreteGate::Custom { basis_index: i2, .. }) => {
-                i1 == i2
+            (DiscreteGate::Custom { matrix_u2: m1, .. }, DiscreteGate::Custom { matrix_u2: m2, .. }) => {
+                // Compare matrices for equality (both are normalized to SU(2))
+                (m1 - m2).norm() < 1e-10
             }
             _ => false,
         }
@@ -292,13 +356,24 @@ impl GateSequence {
     }
 
     /// Return the adjoint.
+    ///
+    /// # Panics
+    /// Panics if any gate in the sequence does not have an inverse. For the Solovay-Kitaev
+    /// algorithm, all discrete basis gates must have inverses.
     pub fn adjoint(&self) -> GateSequence {
         // Flip the gate order and invert them
-        let gates = self
+        let gates: Vec<DiscreteGate> = self
             .gates
             .iter()
             .rev()
-            .filter_map(|gate| gate.inverse())
+            .map(|gate| {
+                gate.inverse().unwrap_or_else(|| {
+                    panic!(
+                        "Gate '{}' does not have an inverse. All discrete basis gates must have inverses.",
+                        gate.name()
+                    )
+                })
+            })
             .collect();
 
         // The transpose of an orthogonal matrix is equal to its inverse
@@ -694,8 +769,22 @@ impl BasicApproximations {
     }
 
     /// Query the closest point to a [GateSequence].
+    ///
+    /// Returns None if the input matrix contains NaN or Inf values, which would
+    /// cause the R-tree nearest neighbor search to panic.
     pub fn query(&self, matrix: &Matrix3<f64>) -> Option<&GateSequence> {
+        // Validate input matrix doesn't contain NaN or Inf (causes R-tree panic)
+        if matrix.iter().any(|&val| !val.is_finite()) {
+            return None;
+        }
+
         let query_point = BasicPoint::from_matrix(matrix);
+
+        // Validate the query point doesn't have NaN
+        if query_point.point.iter().any(|&val| !val.is_finite()) {
+            return None;
+        }
+
         self.points.nearest_neighbor(&query_point).map(|point| {
             let index = point
                 .index
